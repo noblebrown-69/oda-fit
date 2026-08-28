@@ -1,0 +1,7 @@
+/fitd
+/build/
+*.o
+*.db
+*.db-shm
+*.db-wal
+*~
