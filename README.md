@@ -2,7 +2,7 @@
 
 ![ODA FIT](screenshot.png)
 
-A phone page for a [Hermes](https://github.com/NousResearch/hermes-agent) fitness ledger. One small C binary, served on your tailnet, writes the **same SQLite** the local `fit` CLI and the morning digest already read.
+A local private app for a [Hermes](https://github.com/NousResearch/hermes-agent) fitness ledger. One small C binary, served on your tailnet, writes the **same SQLite** the local `fit` CLI and the morning digest already read.
 
 No cloud. No accounts. No second database. Chat is backup. The harness is the record.
 
@@ -10,7 +10,7 @@ No cloud. No accounts. No second database. Chat is backup. The harness is the re
 
 Hermes already owns the training day: a Fitness profile, a `fit` script, and `~/.hermes/profiles/fitness/fitness.db`. The 6am digest calls `fit digest`. `fit audit` flags a missing session or protein. Exercise names, `set_n`, and the weekday map have to stay honest or the morning brief lies.
 
-The failure mode was gym chat. Numbers landed in a thread and never hit `fit`. The logger is the mechanical fix: phone at the rack, boxes per set, same file the harness already trusts.
+The failure mode was gym chat. Numbers landed in a thread and never hit `fit`. The logger is the mechanical fix: at the rack, boxes per set, same file the harness already trusts.
 
 `fitd` does not replace Hermes, the CLI, or the digest. It is a Tailscale-only writer for that ledger.
 
@@ -31,7 +31,7 @@ Monday fasting rest and Tuesday legs do not move. The second rest floats (`meta.
 - Protein card: last filed value + date, and a box for today's grams
 - Rest day: one line, no fake boxes
 
-Phone-first. Dark ink, gold, crimson. Bind Tailscale IPv4 only; `0.0.0.0` is refused. The overlay network is the auth.
+Dark ink, gold, crimson. Bind Tailscale IPv4 only; `0.0.0.0` is refused. The overlay network is the auth.
 
 ## Build
 
