@@ -20,6 +20,7 @@ The failure mode was gym chat. Numbers landed in a thread and never hit `fit`. T
 | CLI | a `fit` script on the same machine (`today`, `set`, `marker`, `digest`, `audit`) |
 | Rotation | copied from `fit` so `_match_exercise` / `_best_working` keep working |
 | Dates | `America/Phoenix` — a UTC clock must not shift the training day |
+| Hold | an unlogged training day stays due until it is logged; Monday fasting rest never becomes a training day. A set filed while held lands on the held date. |
 
 Monday fasting rest and Tuesday legs do not move. The second rest floats (`meta.float_rest`). Protein is a separate marker, often later the same night. Saving a set never requires it.
 

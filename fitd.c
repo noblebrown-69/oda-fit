@@ -243,9 +243,14 @@ static void build_weekday_map(int float_wd, int map[7]) {
 
 typedef struct {
     char date[32];
+    char session_date[32];
     char created[64];
+    char held_date[32];
+    char hold_line[192];
     int py_wd;
     int day_n;
+    int cal_day_n;
+    int held;
 } Today;
 
 static void phoenix_now(Today *t, int weekday_map[7]) {
@@ -263,7 +268,134 @@ static void phoenix_now(Today *t, int weekday_map[7]) {
              tm.tm_hour, tm.tm_min, tm.tm_sec, off >= 0 ? '+' : '-', ah, am);
     t->py_wd = (tm.tm_wday + 6) % 7;
     t->day_n = weekday_map[t->py_wd];
+    t->cal_day_n = t->day_n;
+    t->held = 0;
+    snprintf(t->session_date, sizeof t->session_date, "%s", t->date);
+    t->held_date[0] = 0;
+    t->hold_line[0] = 0;
 }
+
+static int parse_ymd(const char *s, struct tm *tm) {
+    memset(tm, 0, sizeof *tm);
+    int y = 0, m = 0, d = 0;
+    if (!s || sscanf(s, "%d-%d-%d", &y, &m, &d) != 3) return -1;
+    tm->tm_year = y - 1900;
+    tm->tm_mon = m - 1;
+    tm->tm_mday = d;
+    tm->tm_isdst = -1;
+    return 0;
+}
+
+static int add_days_ymd(const char *in, int days, char *out, size_t n) {
+    struct tm tm;
+    if (parse_ymd(in, &tm) != 0) return -1;
+    tm.tm_mday += days;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1) return -1;
+    localtime_r(&t, &tm);
+    snprintf(out, n, "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return 0;
+}
+
+static int py_wd_of(const char *ymd) {
+    struct tm tm;
+    if (parse_ymd(ymd, &tm) != 0) return -1;
+    time_t t = mktime(&tm);
+    if (t == (time_t)-1) return -1;
+    localtime_r(&t, &tm);
+    return (tm.tm_wday + 6) % 7;
+}
+
+static int session_has_work(const char *day) {
+    sqlite3_stmt *st = NULL;
+    int sid = 0;
+    char notes[512] = "";
+    if (sqlite3_prepare_v2(g_db, "SELECT id, notes FROM sessions WHERE day=?", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, day, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return 0; }
+    sid = sqlite3_column_int(st, 0);
+    const unsigned char *n = sqlite3_column_text(st, 1);
+    if (n) snprintf(notes, sizeof notes, "%s", (const char *)n);
+    sqlite3_finalize(st);
+    trim(notes);
+    if (notes[0]) return 1;
+    if (sqlite3_prepare_v2(g_db, "SELECT COUNT(*) FROM sets WHERE session_id=?", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, sid);
+    int nsets = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) nsets = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return nsets > 0;
+}
+
+static int held_training(const char *today, int weekday_map[7], char *held_day, size_t n, int *held_dn) {
+    sqlite3_stmt *st = NULL;
+    const char *sql =
+        "SELECT sess.day FROM sessions sess "
+        "WHERE sess.day <= ? AND sess.day_n IN (1,2,3,5,6) AND ("
+        "  (SELECT COUNT(*) FROM sets s WHERE s.session_id = sess.id) > 0 "
+        "  OR TRIM(COALESCE(sess.notes,'')) != ''"
+        ") ORDER BY sess.day DESC LIMIT 1";
+    char start[32] = "";
+    int have_last = 0;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, today, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *d = sqlite3_column_text(st, 0);
+            if (d && d[0]) { snprintf(start, sizeof start, "%s", (const char *)d); have_last = 1; }
+        }
+        sqlite3_finalize(st);
+    }
+    char cur[32];
+    if (have_last) {
+        if (add_days_ymd(start, 1, cur, sizeof cur) != 0) return 0;
+    } else if (add_days_ymd(today, -21, cur, sizeof cur) != 0) {
+        return 0;
+    }
+    for (int i = 0; i < 40 && strcmp(cur, today) <= 0; i++) {
+        int wd = py_wd_of(cur);
+        if (wd < 0 || wd > 6) return 0;
+        int dn = weekday_map[wd];
+        if (dn >= 0 && dn <= 7 && ROTATION[dn].nlifts > 0 && !session_has_work(cur)) {
+            snprintf(held_day, n, "%s", cur);
+            *held_dn = dn;
+            return 1;
+        }
+        char nxt[32];
+        if (add_days_ymd(cur, 1, nxt, sizeof nxt) != 0) return 0;
+        snprintf(cur, sizeof cur, "%s", nxt);
+    }
+    return 0;
+}
+
+static void apply_due(Today *t, int weekday_map[7]) {
+    char hd[32];
+    int hn = 0;
+    if (!held_training(t->date, weekday_map, hd, sizeof hd, &hn)) return;
+    t->held = 1;
+    snprintf(t->held_date, sizeof t->held_date, "%s", hd);
+    int cal = t->cal_day_n;
+    if (cal == 0) {
+        t->day_n = 0;
+    } else {
+        t->day_n = hn;
+        snprintf(t->session_date, sizeof t->session_date, "%s", hd);
+    }
+    if (t->day_n == 0)
+        snprintf(t->hold_line, sizeof t->hold_line,
+                 "HOLD: %s %s unlogged — cycle does not advance (Monday fasting rest)",
+                 hd, ROTATION[hn].label);
+    else if (cal != hn)
+        snprintf(t->hold_line, sizeof t->hold_line,
+                 "HOLD: %s %s unlogged — calendar %s waits",
+                 hd, ROTATION[hn].label, ROTATION[cal].label);
+    else
+        snprintf(t->hold_line, sizeof t->hold_line,
+                 "HOLD: %s %s unlogged — calendar does not advance",
+                 hd, ROTATION[hn].label);
+}
+
 
 static int load_float_rest(void) {
     int fw = DEFAULT_FLOAT_REST;
@@ -337,19 +469,19 @@ static int session_id_today(const char *day) {
 }
 
 static int ensure_session(const Today *t) {
-    int id = session_id_today(t->date);
+    int id = session_id_today(t->session_date);
     if (id) return id;
     sqlite3_stmt *st = NULL;
     const char *sql = "INSERT INTO sessions(day, day_n, label, notes, created_at) VALUES (?,?,?,?,?)";
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(st, 1, t->date, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, t->session_date, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, t->day_n);
     sqlite3_bind_text(st, 3, ROTATION[t->day_n].label, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 4, "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 5, t->created, -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    return rc == SQLITE_DONE ? session_id_today(t->date) : 0;
+    return rc == SQLITE_DONE ? session_id_today(t->session_date) : 0;
 }
 
 static int next_set_n(int sid, const char *ex) {
@@ -542,11 +674,14 @@ static void append_logged_json(SB *s, int sid, const char *ex) {
 static void build_today_json(SB *s, const Today *t) {
     const DayProg *d = &ROTATION[t->day_n];
     int rest = d->nlifts == 0;
-    int sid = session_id_today(t->date);
+    int sid = session_id_today(t->session_date);
     sb_puts(s, "{");
     sb_puts(s, "\"date\":"); sb_json(s, t->date);
+    sb_puts(s, ",\"session_date\":"); sb_json(s, t->session_date);
     sb_puts(s, ",\"weekday\":"); sb_json(s, WEEKDAY_NAME[t->py_wd]);
     sb_puts(s, ",\"label\":"); sb_json(s, d->label);
+    sb_printf(s, ",\"held\":%s", t->held ? "true" : "false");
+    sb_puts(s, ",\"hold_line\":"); sb_json(s, t->held ? t->hold_line : NULL);
     sb_printf(s, ",\"rest\":%s,\"lifts\":[", rest ? "true" : "false");
     for (int i = 0; i < d->nlifts; i++) {
         if (i) sb_puts(s, ",");
@@ -568,6 +703,7 @@ static void handle_today_json(SB *out) {
     build_weekday_map(load_float_rest(), map);
     Today t;
     phoenix_now(&t, map);
+    apply_due(&t, map);
     SB body; sb_init(&body);
     build_today_json(&body, &t);
     send_sb(out, 200, "OK", "application/json; charset=utf-8", &body);
@@ -631,6 +767,7 @@ static const char CSS[] =
 "font-size:2.05rem;line-height:1.08;color:var(--ink);font-weight:700}"
 ".day{margin-top:.35rem;font-family:'Cormorant Garamond',Georgia,serif;"
 "font-size:1.05rem;letter-spacing:.08em;color:var(--muted)}"
+".hold{margin-top:.55rem;color:var(--gold);font-size:.78rem;letter-spacing:.04em;line-height:1.35}"
 ".rest{margin:1.6rem 0;padding:1.4rem .6rem;text-align:center;"
 "border-top:1px solid var(--gold);border-bottom:1px solid var(--gold);"
 "background:transparent}"
@@ -746,9 +883,10 @@ static void handle_index(SB *out) {
     int map[7];
     build_weekday_map(load_float_rest(), map);
     Today t; phoenix_now(&t, map);
+    apply_due(&t, map);
     const DayProg *d = &ROTATION[t.day_n];
     int rest = d->nlifts == 0;
-    int sid = session_id_today(t.date);
+    int sid = session_id_today(t.session_date);
     SB b; sb_init(&b);
     sb_puts(&b, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">"
@@ -768,7 +906,13 @@ static void handle_index(SB *out) {
     sb_html(&b, WEEKDAY_NAME[t.py_wd]);
     sb_puts(&b, " · ");
     sb_html(&b, t.date);
-    sb_puts(&b, "</div></header>");
+    sb_puts(&b, "</div>");
+    if (t.held && t.hold_line[0]) {
+        sb_puts(&b, "<div class=\"hold\">");
+        sb_html(&b, t.hold_line);
+        sb_puts(&b, "</div>");
+    }
+    sb_puts(&b, "</header>");
     if (rest) {
         sb_puts(&b, "<section class=\"rest\"><h2>");
         sb_puts(&b, t.day_n == 0 ? "FASTING REST" : "REST");
@@ -870,6 +1014,7 @@ static void handle_set(SB *out, const char *ctype, const char *body) {
     int map[7];
     build_weekday_map(load_float_rest(), map);
     Today t; phoenix_now(&t, map);
+    apply_due(&t, map);
     if (ROTATION[t.day_n].nlifts == 0) {
         send_text(out, 400, "Bad Request", "text/plain; charset=utf-8", "rest day\n");
         return;
