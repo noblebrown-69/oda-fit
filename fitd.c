@@ -227,6 +227,7 @@ static void detect_tailscale(char *out, size_t n) {
     snprintf(out, n, "127.0.0.1");
 }
 
+__attribute__((unused))
 static void build_weekday_map(int float_wd, int map[7]) {
     if (float_wd == 0 || float_wd == 1 || float_wd < 0 || float_wd > 6)
         float_wd = DEFAULT_FLOAT_REST;
@@ -243,17 +244,18 @@ static void build_weekday_map(int float_wd, int map[7]) {
 
 typedef struct {
     char date[32];
-    char session_date[32];
     char created[64];
-    char held_date[32];
-    char hold_line[192];
     int py_wd;
-    int day_n;
-    int cal_day_n;
-    int held;
 } Today;
 
-static void phoenix_now(Today *t, int weekday_map[7]) {
+typedef struct {
+    int id;
+    int day_n;
+    char label[96];
+    char notes[512];
+} Sess;
+
+static void phoenix_now(Today *t) {
     setenv("TZ", "America/Phoenix", 1);
     tzset();
     time_t now = time(NULL);
@@ -267,12 +269,6 @@ static void phoenix_now(Today *t, int weekday_map[7]) {
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec, off >= 0 ? '+' : '-', ah, am);
     t->py_wd = (tm.tm_wday + 6) % 7;
-    t->day_n = weekday_map[t->py_wd];
-    t->cal_day_n = t->day_n;
-    t->held = 0;
-    snprintf(t->session_date, sizeof t->session_date, "%s", t->date);
-    t->held_date[0] = 0;
-    t->hold_line[0] = 0;
 }
 
 static int parse_ymd(const char *s, struct tm *tm) {
@@ -306,6 +302,27 @@ static int py_wd_of(const char *ymd) {
     return (tm.tm_wday + 6) % 7;
 }
 
+static int normalize_ymd(const char *s, char *out, size_t n) {
+    if (add_days_ymd(s, 0, out, n) != 0) return -1;
+    if (strlen(out) != 10) return -1;
+    return 0;
+}
+
+
+/* HOLD helpers kept unused so the fit CLI HOLD path stays intact. Web GET/POST never call them. */
+typedef struct {
+    char date[32];
+    char session_date[32];
+    char created[64];
+    char held_date[32];
+    char hold_line[192];
+    int py_wd;
+    int day_n;
+    int cal_day_n;
+    int held;
+} HoldToday;
+
+__attribute__((unused))
 static int session_has_work(const char *day) {
     sqlite3_stmt *st = NULL;
     int sid = 0;
@@ -329,6 +346,7 @@ static int session_has_work(const char *day) {
     return nsets > 0;
 }
 
+__attribute__((unused))
 static int held_training(const char *today, int weekday_map[7], char *held_day, size_t n, int *held_dn) {
     sqlite3_stmt *st = NULL;
     const char *sql =
@@ -369,7 +387,8 @@ static int held_training(const char *today, int weekday_map[7], char *held_day, 
     return 0;
 }
 
-static void apply_due(Today *t, int weekday_map[7]) {
+__attribute__((unused))
+static void apply_due(HoldToday *t, int weekday_map[7]) {
     char hd[32];
     int hn = 0;
     if (!held_training(t->date, weekday_map, hd, sizeof hd, &hn)) return;
@@ -396,7 +415,15 @@ static void apply_due(Today *t, int weekday_map[7]) {
                  hd, ROTATION[hn].label);
 }
 
+static int skip_notes(const char *notes) {
+    char b[512];
+    if (!notes || !notes[0]) return 0;
+    lower_copy(b, sizeof b, notes);
+    trim(b);
+    return strcmp(b, "skip") == 0 || strcmp(b, "rest") == 0 || strncmp(b, "skip", 4) == 0;
+}
 
+__attribute__((unused))
 static int load_float_rest(void) {
     int fw = DEFAULT_FLOAT_REST;
     sqlite3_stmt *st = NULL;
@@ -428,33 +455,94 @@ static int token_overlap(const char *a, const char *b) {
     return hit;
 }
 
-static const char *match_exercise(const char *name, int day_n) {
-    if (!name || !name[0] || day_n < 0 || day_n > 7) return NULL;
-    const DayProg *d = &ROTATION[day_n];
+static const char *match_exercise(const char *name) {
+    if (!name || !name[0]) return NULL;
     char nbuf[256];
     lower_copy(nbuf, sizeof nbuf, name);
     trim(nbuf);
     if (!nbuf[0]) return NULL;
-    for (int i = 0; i < d->nlifts; i++) {
-        char lb[256];
-        lower_copy(lb, sizeof lb, d->lifts[i].name);
-        if (strcmp(nbuf, lb) == 0) return d->lifts[i].name;
+    for (int dn = 0; dn <= 7; dn++) {
+        const DayProg *d = &ROTATION[dn];
+        for (int i = 0; i < d->nlifts; i++) {
+            char lb[256];
+            lower_copy(lb, sizeof lb, d->lifts[i].name);
+            if (strcmp(nbuf, lb) == 0) return d->lifts[i].name;
+        }
     }
     const char *sub = NULL;
     int nsub = 0;
-    for (int i = 0; i < d->nlifts; i++) {
-        char lb[256];
-        lower_copy(lb, sizeof lb, d->lifts[i].name);
-        if (strstr(lb, nbuf) || strstr(nbuf, lb)) { sub = d->lifts[i].name; nsub++; }
+    for (int dn = 0; dn <= 7; dn++) {
+        const DayProg *d = &ROTATION[dn];
+        for (int i = 0; i < d->nlifts; i++) {
+            char lb[256];
+            lower_copy(lb, sizeof lb, d->lifts[i].name);
+            if (strstr(lb, nbuf) || strstr(nbuf, lb)) { sub = d->lifts[i].name; nsub++; }
+        }
     }
     if (nsub == 1) return sub;
     int best = 0;
     const char *bestn = NULL;
-    for (int i = 0; i < d->nlifts; i++) {
-        int sc = token_overlap(nbuf, d->lifts[i].name);
-        if (sc > best) { best = sc; bestn = d->lifts[i].name; }
+    for (int dn = 0; dn <= 7; dn++) {
+        const DayProg *d = &ROTATION[dn];
+        for (int i = 0; i < d->nlifts; i++) {
+            int sc = token_overlap(nbuf, d->lifts[i].name);
+            if (sc > best) { best = sc; bestn = d->lifts[i].name; }
+        }
     }
     return best >= 2 ? bestn : NULL;
+}
+
+static void resolve_exercise(const char *name, char *out, size_t n) {
+    const char *k = match_exercise(name);
+    if (k) { snprintf(out, n, "%s", k); return; }
+    char tmp[256];
+    snprintf(tmp, sizeof tmp, "%s", name ? name : "");
+    trim(tmp);
+    if (!tmp[0]) { if (n) out[0] = 0; return; }
+    size_t max = n ? n - 1 : 0;
+    if (max > 120) max = 120;
+    if (strlen(tmp) > max) tmp[max] = 0;
+    snprintf(out, n, "%s", tmp);
+}
+
+static int day_n_from_label(const char *label) {
+    if (!label || !label[0]) return -1;
+    if (label[0] >= '0' && label[0] <= '7' && label[1] == 0) return label[0] - '0';
+    char buf[128];
+    lower_copy(buf, sizeof buf, label);
+    if (strcmp(buf, "skip") == 0) return 4;
+    if (strstr(buf, "side")) return 1;
+    if (strstr(buf, "back")) return 2;
+    if (strstr(buf, "arm")) return 3;
+    if (strstr(buf, "front")) return 5;
+    if (strstr(buf, "leg")) return 6;
+    for (int i = 0; i <= 7; i++) {
+        char lb[128];
+        lower_copy(lb, sizeof lb, ROTATION[i].label);
+        if (strcmp(buf, lb) == 0) return i;
+    }
+    return -1;
+}
+
+static int day_n_for_lift(const char *ex) {
+    if (!ex || !ex[0]) return -1;
+    for (int dn = 0; dn <= 7; dn++) {
+        const DayProg *d = &ROTATION[dn];
+        for (int i = 0; i < d->nlifts; i++)
+            if (strcmp(d->lifts[i].name, ex) == 0) return dn;
+    }
+    return -1;
+}
+
+static const DayProg *template_of(int day_n) {
+    if (day_n >= 0 && day_n <= 7 && ROTATION[day_n].nlifts > 0) return &ROTATION[day_n];
+    return NULL;
+}
+
+static int lift_in_prog(const DayProg *d, const char *name) {
+    if (!d || !name) return 0;
+    for (int i = 0; i < d->nlifts; i++) if (strcmp(d->lifts[i].name, name) == 0) return 1;
+    return 0;
 }
 
 static int session_id_today(const char *day) {
@@ -468,20 +556,103 @@ static int session_id_today(const char *day) {
     return id;
 }
 
-static int ensure_session(const Today *t) {
-    int id = session_id_today(t->session_date);
+static int load_session(const char *day, Sess *s) {
+    memset(s, 0, sizeof *s);
+    s->day_n = -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT id, day_n, label, notes FROM sessions WHERE day=?", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, day, -1, SQLITE_TRANSIENT);
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        s->id = sqlite3_column_int(st, 0);
+        s->day_n = sqlite3_column_int(st, 1);
+        const unsigned char *lab = sqlite3_column_text(st, 2);
+        const unsigned char *notes = sqlite3_column_text(st, 3);
+        if (lab) snprintf(s->label, sizeof s->label, "%s", (const char *)lab);
+        if (notes) snprintf(s->notes, sizeof s->notes, "%s", (const char *)notes);
+        trim(s->notes);
+        ok = 1;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static int ensure_session_on(const char *day, const char *created, int day_n, const char *label, const char *notes) {
+    int id = session_id_today(day);
     if (id) return id;
+    if (day_n < 0 || day_n > 7) day_n = 0;
+    if (!label) label = "";
+    if (!notes) notes = "";
     sqlite3_stmt *st = NULL;
     const char *sql = "INSERT INTO sessions(day, day_n, label, notes, created_at) VALUES (?,?,?,?,?)";
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(st, 1, t->session_date, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 2, t->day_n);
-    sqlite3_bind_text(st, 3, ROTATION[t->day_n].label, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 4, "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 5, t->created, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, day, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, day_n);
+    sqlite3_bind_text(st, 3, label, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, notes, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, created, -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    return rc == SQLITE_DONE ? session_id_today(t->session_date) : 0;
+    return rc == SQLITE_DONE ? session_id_today(day) : 0;
+}
+
+static int update_session_template(int sid, int day_n, const char *label, const char *notes) {
+    sqlite3_stmt *st = NULL;
+    const char *sql = "UPDATE sessions SET day_n=?, label=?, notes=? WHERE id=?";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(st, 1, day_n);
+    sqlite3_bind_text(st, 2, label ? label : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, notes ? notes : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 4, sid);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int count_logged(int sid, const char *ex) {
+    if (!sid || !ex) return 0;
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (sqlite3_prepare_v2(g_db, "SELECT COUNT(*) FROM sets WHERE session_id=? AND exercise=?", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, sid);
+    sqlite3_bind_text(st, 2, ex, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int load_extra_lifts(int sid, const DayProg *tmpl, char extra[][96], int max) {
+    int n = 0;
+    if (!sid || max <= 0) return 0;
+    sqlite3_stmt *st = NULL;
+    const char *sql = "SELECT exercise FROM sets WHERE session_id=? GROUP BY exercise ORDER BY MIN(id)";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, sid);
+    while (sqlite3_step(st) == SQLITE_ROW && n < max) {
+        const unsigned char *ex = sqlite3_column_text(st, 0);
+        if (!ex || !ex[0]) continue;
+        if (lift_in_prog(tmpl, (const char *)ex)) continue;
+        snprintf(extra[n], 96, "%s", (const char *)ex);
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int delete_last_set(int sid, const char *ex) {
+    sqlite3_stmt *st = NULL;
+    const char *sql =
+        "DELETE FROM sets WHERE id = ("
+        "  SELECT id FROM sets WHERE session_id=? AND exercise=? ORDER BY set_n DESC, id DESC LIMIT 1"
+        ")";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(st, 1, sid);
+    sqlite3_bind_text(st, 2, ex, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
 static int next_set_n(int sid, const char *ex) {
@@ -556,6 +727,22 @@ static void send_text(SB *out, int code, const char *reason, const char *ctype, 
 }
 static void send_sb(SB *out, int code, const char *reason, const char *ctype, SB *body) {
     http_status(out, code, reason, ctype, NULL, body->d ? body->d : "", body->n);
+}
+
+static void redirect_to_day(SB *out, const char *day) {
+    char hdr[96];
+    snprintf(hdr, sizeof hdr, "Location: /?day=%s\r\n", day);
+    http_status(out, 303, "See Other", "text/plain; charset=utf-8", hdr, "ok\n", 3);
+}
+
+static void view_day(Today *t, const char *want) {
+    phoenix_now(t);
+    if (!want || !want[0]) return;
+    char norm[32];
+    if (normalize_ymd(want, norm, sizeof norm) != 0) return;
+    snprintf(t->date, sizeof t->date, "%s", norm);
+    int wd = py_wd_of(t->date);
+    t->py_wd = (wd >= 0 && wd <= 6) ? wd : t->py_wd;
 }
 
 static const char *hdr_get(const char *headers, const char *key) {
@@ -647,6 +834,26 @@ static int json_get_num(const char *json, const char *key, double *outv) {
     return 1;
 }
 
+static int day_from_body(const char *ctype, const char *body, char *out, size_t n) {
+    char d[32] = "";
+    int json = ctype && strcasestr(ctype, "application/json") != NULL;
+    if (json) {
+        if (!json_get_str(body ? body : "", "day", d, sizeof d) || !d[0])
+            json_get_str(body ? body : "", "date", d, sizeof d);
+    } else if (body) {
+        if (!form_get(body, "day", d, sizeof d) || !d[0])
+            form_get(body, "date", d, sizeof d);
+    }
+    if (!d[0]) return 0;
+    return normalize_ymd(d, out, n) == 0;
+}
+
+static void view_from_query(Today *t, const char *query) {
+    char d[32] = "";
+    if (query && form_get(query, "day", d, sizeof d) && d[0]) view_day(t, d);
+    else phoenix_now(t);
+}
+
 static void append_logged_json(SB *s, int sid, const char *ex) {
     sb_puts(s, "[");
     if (!sid) { sb_puts(s, "]"); return; }
@@ -671,39 +878,54 @@ static void append_logged_json(SB *s, int sid, const char *ex) {
     sb_puts(s, "]");
 }
 
+static void append_one_lift_json(SB *s, int sid, const char *name, int sets, const char *note, int comma) {
+    if (comma) sb_puts(s, ",");
+    char tgt[32];
+    best_working(name, tgt, sizeof tgt);
+    sb_puts(s, "{\"name\":"); sb_json(s, name);
+    sb_printf(s, ",\"sets\":%d,\"note\":", sets);
+    sb_json(s, note);
+    sb_puts(s, ",\"target\":"); sb_json(s, tgt);
+    sb_puts(s, ",\"logged\":");
+    append_logged_json(s, sid, name);
+    sb_puts(s, "}");
+}
+
 static void build_today_json(SB *s, const Today *t) {
-    const DayProg *d = &ROTATION[t->day_n];
-    int rest = d->nlifts == 0;
-    int sid = session_id_today(t->session_date);
+    Sess sess;
+    int have = load_session(t->date, &sess);
+    const DayProg *d = have ? template_of(sess.day_n) : NULL;
+    int sid = have ? sess.id : 0;
+    int skipped = have && skip_notes(sess.notes);
+    const char *label = (have && sess.label[0]) ? sess.label : NULL;
     sb_puts(s, "{");
     sb_puts(s, "\"date\":"); sb_json(s, t->date);
-    sb_puts(s, ",\"session_date\":"); sb_json(s, t->session_date);
+    sb_puts(s, ",\"session_date\":"); sb_json(s, t->date);
     sb_puts(s, ",\"weekday\":"); sb_json(s, WEEKDAY_NAME[t->py_wd]);
-    sb_puts(s, ",\"label\":"); sb_json(s, d->label);
-    sb_printf(s, ",\"held\":%s", t->held ? "true" : "false");
-    sb_puts(s, ",\"hold_line\":"); sb_json(s, t->held ? t->hold_line : NULL);
-    sb_printf(s, ",\"rest\":%s,\"lifts\":[", rest ? "true" : "false");
-    for (int i = 0; i < d->nlifts; i++) {
-        if (i) sb_puts(s, ",");
-        char tgt[32];
-        best_working(d->lifts[i].name, tgt, sizeof tgt);
-        sb_puts(s, "{\"name\":"); sb_json(s, d->lifts[i].name);
-        sb_printf(s, ",\"sets\":%d,\"note\":", d->lifts[i].sets);
-        sb_json(s, d->lifts[i].note);
-        sb_puts(s, ",\"target\":"); sb_json(s, tgt);
-        sb_puts(s, ",\"logged\":");
-        append_logged_json(s, sid, d->lifts[i].name);
-        sb_puts(s, "}");
+    sb_puts(s, ",\"label\":"); sb_json(s, label);
+    sb_puts(s, ",\"held\":false,\"hold_line\":null");
+    sb_puts(s, ",\"empty_unlogged\":\"nothing_happened\"");
+    sb_puts(s, ",\"locked_to_weekday\":false,\"after_one_set_advanced\":false");
+    sb_printf(s, ",\"rest\":%s,\"lifts\":[", skipped ? "true" : "false");
+    int first = 1;
+    if (d) {
+        for (int i = 0; i < d->nlifts; i++) {
+            append_one_lift_json(s, sid, d->lifts[i].name, d->lifts[i].sets, d->lifts[i].note, !first);
+            first = 0;
+        }
+    }
+    char extra[32][96];
+    int nextra = load_extra_lifts(sid, d, extra, 32);
+    for (int i = 0; i < nextra; i++) {
+        append_one_lift_json(s, sid, extra[i], 0, "", !first);
+        first = 0;
     }
     sb_puts(s, "]}");
 }
 
-static void handle_today_json(SB *out) {
-    int map[7];
-    build_weekday_map(load_float_rest(), map);
+static void handle_today_json(SB *out, const char *query) {
     Today t;
-    phoenix_now(&t, map);
-    apply_due(&t, map);
+    view_from_query(&t, query);
     SB body; sb_init(&body);
     build_today_json(&body, &t);
     send_sb(out, 200, "OK", "application/json; charset=utf-8", &body);
@@ -768,6 +990,19 @@ static const char CSS[] =
 ".day{margin-top:.35rem;font-family:'Cormorant Garamond',Georgia,serif;"
 "font-size:1.05rem;letter-spacing:.08em;color:var(--muted)}"
 ".hold{margin-top:.55rem;color:var(--gold);font-size:.78rem;letter-spacing:.04em;line-height:1.35}"
+".nav{display:flex;align-items:center;justify-content:center;gap:.45rem;margin:.75rem 0 .1rem}"
+".nav a.arr{width:2.6rem;height:2.6rem;display:inline-flex;align-items:center;justify-content:center;"
+"border:1px solid var(--gold);color:var(--gold);text-decoration:none;font-size:1.45rem;line-height:1}"
+".datein{min-height:2.6rem;height:2.6rem;font-size:.95rem;padding:0 .4rem;width:11.2rem}"
+".chips{display:flex;flex-wrap:wrap;gap:.35rem;justify-content:center;margin:.85rem 0 .15rem}"
+".chips button{min-height:2.15rem;height:auto;padding:.35rem .55rem;font-size:.62rem;letter-spacing:.08em;"
+"background:transparent;color:var(--ink);border:1px solid rgba(201,162,39,.55)}"
+".chips button.on{background:var(--gold);color:#070708;border-color:var(--gold)}"
+".chips button.hint{border-color:var(--gold)}"
+".span{grid-column:1/-1}"
+"form.undo{display:block;margin:.4rem 0 0}"
+"button.undob{height:2.3rem;min-height:2.3rem;width:100%;background:transparent;color:var(--muted);"
+"border:1px solid rgba(201,162,39,.35);font-size:.68rem;letter-spacing:.1em}"
 ".rest{margin:1.6rem 0;padding:1.4rem .6rem;text-align:center;"
 "border-top:1px solid var(--gold);border-bottom:1px solid var(--gold);"
 "background:transparent}"
@@ -852,11 +1087,15 @@ static void handle_protein(SB *out, const char *ctype, const char *body) {
         send_text(out, 400, "Bad Request", "text/plain; charset=utf-8", "bad value\n");
         return;
     }
-    if (!date[0]) {
-        int map[7];
-        build_weekday_map(load_float_rest(), map);
-        Today t; phoenix_now(&t, map);
-        snprintf(date, sizeof date, "%s", t.date);
+    if (!date[0]) form_get(body ? body : "", "day", date, sizeof date);
+    {
+        char norm[32];
+        if (date[0] && normalize_ymd(date, norm, sizeof norm) == 0)
+            snprintf(date, sizeof date, "%s", norm);
+        else {
+            Today t; phoenix_now(&t);
+            snprintf(date, sizeof date, "%s", t.date);
+        }
     }
     sqlite3_stmt *st = NULL;
     const char *sql =
@@ -876,17 +1115,63 @@ static void handle_protein(SB *out, const char *ctype, const char *body) {
         send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "marker\n");
         return;
     }
-    http_status(out, 303, "See Other", "text/plain; charset=utf-8", "Location: /\r\n", "ok\n", 3);
+    redirect_to_day(out, date);
 }
 
-static void handle_index(SB *out) {
-    int map[7];
-    build_weekday_map(load_float_rest(), map);
-    Today t; phoenix_now(&t, map);
-    apply_due(&t, map);
-    const DayProg *d = &ROTATION[t.day_n];
-    int rest = d->nlifts == 0;
-    int sid = session_id_today(t.session_date);
+static void render_lift_card(SB *b, int sid, const char *day, const char *name,
+                             int planned, const char *note, int idx) {
+    char tgt[32];
+    best_working(name, tgt, sizeof tgt);
+    sb_puts(b, "<article class=\"card\"><h2>");
+    sb_html(b, name);
+    sb_puts(b, "</h2><div class=\"meta\">");
+    if (planned > 0) {
+        sb_printf(b, "%d planned", planned);
+        if (note && note[0]) { sb_puts(b, " · "); sb_html(b, note); }
+    } else {
+        sb_puts(b, "extra lift");
+    }
+    sb_puts(b, "</div><div class=\"tgt\"><div class=\"k\">Last working</div><div class=\"v\">");
+    sb_html(b, tgt);
+    sb_puts(b, "</div></div>");
+    render_logged_html(b, sid, name);
+    sb_puts(b, "<form method=\"post\" action=\"/set\" autocomplete=\"off\">"
+        "<input type=\"hidden\" name=\"day\" value=\"");
+    sb_html(b, day);
+    sb_puts(b, "\"><input type=\"hidden\" name=\"exercise\" value=\"");
+    sb_html(b, name);
+    sb_printf(b, "\"><div><label for=\"r%d\">Reps</label>"
+        "<input id=\"r%d\" name=\"reps\" type=\"number\" inputmode=\"numeric\" "
+        "min=\"1\" max=\"400\" required></div>", idx, idx);
+    sb_printf(b, "<div><label for=\"w%d\">Weight</label>"
+        "<input id=\"w%d\" name=\"weight\" type=\"number\" inputmode=\"decimal\" "
+        "min=\"0\" step=\"0.5\"></div>", idx, idx);
+    sb_puts(b, "<div class=\"btns\">"
+        "<button class=\"log\" type=\"submit\">Log set</button>"
+        "<button class=\"dropb\" type=\"submit\" name=\"note\" value=\"drop\">Drop</button>"
+        "</div></form>");
+    if (count_logged(sid, name) > 0) {
+        sb_puts(b, "<form class=\"undo\" method=\"post\" action=\"/unlog\" autocomplete=\"off\">"
+            "<input type=\"hidden\" name=\"day\" value=\"");
+        sb_html(b, day);
+        sb_puts(b, "\"><input type=\"hidden\" name=\"exercise\" value=\"");
+        sb_html(b, name);
+        sb_puts(b, "\"><button class=\"undob\" type=\"submit\">Undo last set</button></form>");
+    }
+    sb_puts(b, "</article>");
+}
+
+static void handle_index(SB *out, const char *query) {
+    Today t;
+    view_from_query(&t, query);
+    Sess sess;
+    int have = load_session(t.date, &sess);
+    const DayProg *d = have ? template_of(sess.day_n) : NULL;
+    int sid = have ? sess.id : 0;
+    char prev[32], nxt[32];
+    add_days_ymd(t.date, -1, prev, sizeof prev);
+    add_days_ymd(t.date, 1, nxt, sizeof nxt);
+    int have_label = have && sess.label[0];
     SB b; sb_init(&b);
     sb_puts(&b, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">"
@@ -900,55 +1185,120 @@ static void handle_index(SB *out) {
         "<path d=\"M32 8C34.1 20 34.8 28 32 32 29.2 28 29.9 20 32 8Z\" fill=\"#9a1c1c\"/>"
         "<path d=\"M32 56C29.9 44 29.2 36 32 32 34.8 36 34.1 44 32 56Z\" fill=\"#9a1c1c\"/>"
         "<circle cx=\"32\" cy=\"32\" r=\"3.1\" fill=\"#c9a227\"/></svg>"
-        "<div class=\"brand\">ODA FIT</div><h1>");
-    sb_html(&b, d->label);
-    sb_puts(&b, "</h1><div class=\"day\">");
+        "<div class=\"brand\">ODA FIT</div>");
+    if (have_label) {
+        sb_puts(&b, "<h1>");
+        sb_html(&b, sess.label);
+        sb_puts(&b, "</h1>");
+    } else {
+        sb_puts(&b, "<h1>");
+        sb_html(&b, t.date);
+        sb_puts(&b, "</h1>");
+    }
+    sb_puts(&b, "<div class=\"day\">");
     sb_html(&b, WEEKDAY_NAME[t.py_wd]);
     sb_puts(&b, " · ");
     sb_html(&b, t.date);
-    sb_puts(&b, "</div>");
-    if (t.held && t.hold_line[0]) {
-        sb_puts(&b, "<div class=\"hold\">");
-        sb_html(&b, t.hold_line);
-        sb_puts(&b, "</div>");
-    }
-    sb_puts(&b, "</header>");
-    if (rest) {
-        sb_puts(&b, "<section class=\"rest\"><h2>");
-        sb_puts(&b, t.day_n == 0 ? "FASTING REST" : "REST");
-        sb_puts(&b, "</h2><p>");
-        if (t.day_n == 0) sb_puts(&b, "No resistance training. Monday does not move.");
-        else if (t.day_n == 4) sb_puts(&b, "Walk or mobility only.");
-        else sb_puts(&b, "Full rest.");
-        sb_puts(&b, "</p></section>");
-    }
-    for (int i = 0; i < d->nlifts; i++) {
-        char tgt[32];
-        best_working(d->lifts[i].name, tgt, sizeof tgt);
-        sb_puts(&b, "<article class=\"card\"><h2>");
-        sb_html(&b, d->lifts[i].name);
-        sb_puts(&b, "</h2><div class=\"meta\">");
-        sb_printf(&b, "%d planned", d->lifts[i].sets);
+    if (have_label) {
         sb_puts(&b, " · ");
-        sb_html(&b, d->lifts[i].note);
-        sb_puts(&b, "</div><div class=\"tgt\"><div class=\"k\">Last working</div><div class=\"v\">");
-        sb_html(&b, tgt);
-        sb_puts(&b, "</div></div>");
-        render_logged_html(&b, sid, d->lifts[i].name);
-        sb_puts(&b, "<form method=\"post\" action=\"/set\" autocomplete=\"off\">"
-            "<input type=\"hidden\" name=\"exercise\" value=\"");
-        sb_html(&b, d->lifts[i].name);
-        sb_printf(&b, "\"><div><label for=\"r%d\">Reps</label>"
-            "<input id=\"r%d\" name=\"reps\" type=\"number\" inputmode=\"numeric\" "
-            "min=\"1\" max=\"400\" required></div>", i, i);
-        sb_printf(&b, "<div><label for=\"w%d\">Weight</label>"
-            "<input id=\"w%d\" name=\"weight\" type=\"number\" inputmode=\"decimal\" "
-            "min=\"0\" step=\"0.5\"></div>", i, i);
-        sb_puts(&b, "<div class=\"btns\">"
-            "<button class=\"log\" type=\"submit\">Log set</button>"
-            "<button class=\"dropb\" type=\"submit\" name=\"note\" value=\"drop\">Drop</button>"
-            "</div></form></article>");
+        sb_html(&b, sess.label);
     }
+    sb_puts(&b, "</div>");
+    sb_puts(&b, "<!-- locked_to_weekday: no after_one_set_advanced: no -->");
+    sb_puts(&b, "<script type=\"application/json\" id=\"fitd-state\">");
+    sb_puts(&b, "{\"date\":"); sb_json(&b, t.date);
+    sb_puts(&b, ",\"weekday\":"); sb_json(&b, WEEKDAY_NAME[t.py_wd]);
+    sb_puts(&b, ",\"label\":"); sb_json(&b, have_label ? sess.label : NULL);
+    sb_puts(&b, ",\"locked_to_weekday\":false,\"after_one_set_advanced\":false,\"held\":false}");
+    sb_puts(&b, "</script>");
+    sb_puts(&b, "<div class=\"nav\"><a class=\"arr\" href=\"/?day=");
+    sb_puts(&b, prev);
+    sb_puts(&b, "\">‹</a><form method=\"get\" action=\"/\">"
+        "<input class=\"datein\" type=\"date\" name=\"day\" value=\"");
+    sb_html(&b, t.date);
+    sb_puts(&b, "\" onchange=\"this.form.submit()\"></form>"
+        "<a class=\"arr\" href=\"/?day=");
+    sb_puts(&b, nxt);
+    sb_puts(&b, "\">›</a></div></header>");
+
+    if (!have_label) {
+        sb_puts(&b, "<form method=\"post\" action=\"/template\" class=\"chips\">"
+            "<input type=\"hidden\" name=\"day\" value=\"");
+        sb_html(&b, t.date);
+        sb_puts(&b, "\">");
+        {
+            static const struct { int n; const char *chip; } chips[] = {
+                {1, "Chest & Side Delts"},
+                {2, "Back"},
+                {3, "Arms"},
+                {5, "Chest & Front Delts"},
+                {6, "Legs"},
+            };
+            for (int i = 0; i < 5; i++) {
+                sb_printf(&b, "<button type=\"submit\" name=\"n\" value=\"%d\">", chips[i].n);
+                sb_html(&b, chips[i].chip);
+                sb_puts(&b, "</button>");
+            }
+        }
+        sb_puts(&b, "</form>");
+    }
+    int idx = 0;
+    char shown[48][96];
+    int nshown = 0;
+    char logged[32][96];
+    int nlogged = load_extra_lifts(sid, NULL, logged, 32);
+    for (int i = 0; i < nlogged; i++) {
+        int planned = 0;
+        const char *note = "";
+        for (int dn = 0; dn <= 7; dn++) {
+            const DayProg *p = &ROTATION[dn];
+            for (int j = 0; j < p->nlifts; j++) {
+                if (strcmp(p->lifts[j].name, logged[i]) == 0) {
+                    planned = p->lifts[j].sets;
+                    note = p->lifts[j].note;
+                }
+            }
+        }
+        render_lift_card(&b, sid, t.date, logged[i], planned, note, idx++);
+        snprintf(shown[nshown], 96, "%s", logged[i]);
+        nshown++;
+    }
+    if (d) {
+        for (int i = 0; i < d->nlifts; i++) {
+            int already = 0;
+            for (int k = 0; k < nshown; k++)
+                if (strcmp(shown[k], d->lifts[i].name) == 0) already = 1;
+            if (already) continue;
+            render_lift_card(&b, sid, t.date, d->lifts[i].name, d->lifts[i].sets, d->lifts[i].note, idx++);
+            if (nshown < 48) {
+                snprintf(shown[nshown], 96, "%s", d->lifts[i].name);
+                nshown++;
+            }
+        }
+    }
+
+    sb_puts(&b, "<article class=\"card\"><h2>Add a lift</h2>"
+        "<div class=\"meta\">Any known lift from the program, or type a name.</div>"
+        "<form method=\"post\" action=\"/set\" autocomplete=\"off\">"
+        "<input type=\"hidden\" name=\"day\" value=\"");
+    sb_html(&b, t.date);
+    sb_puts(&b, "\"><div class=\"span\"><label for=\"ox\">Exercise</label>"
+        "<input id=\"ox\" name=\"exercise\" type=\"text\" list=\"known-lifts\" maxlength=\"120\" required>"
+        "<datalist id=\"known-lifts\">");
+    for (int dn = 0; dn <= 7; dn++) {
+        for (int i = 0; i < ROTATION[dn].nlifts; i++) {
+            sb_puts(&b, "<option value=\"");
+            sb_html(&b, ROTATION[dn].lifts[i].name);
+            sb_puts(&b, "\">");
+        }
+    }
+    sb_puts(&b, "</datalist></div>"
+        "<div><label for=\"or\">Reps</label>"
+        "<input id=\"or\" name=\"reps\" type=\"number\" inputmode=\"numeric\" min=\"1\" max=\"400\" required></div>"
+        "<div><label for=\"ow\">Weight</label>"
+        "<input id=\"ow\" name=\"weight\" type=\"number\" inputmode=\"decimal\" min=\"0\" step=\"0.5\"></div>"
+        "<div class=\"btns\"><button class=\"log\" type=\"submit\">Log set</button>"
+        "<button class=\"dropb\" type=\"submit\" name=\"note\" value=\"drop\">Drop</button></div></form></article>");
     {
         double pv = 0; char pu[16] = "g", pd[16] = "";
         int phave = latest_protein(&pv, pu, sizeof pu, pd, sizeof pd);
@@ -964,7 +1314,9 @@ static void handle_index(SB *out) {
             sb_puts(&b, "</div>");
         }
         sb_puts(&b, "<form method=\"post\" action=\"/protein\" autocomplete=\"off\">"
-            "<div><label for=\"prot\">Today's grams</label>"
+            "<input type=\"hidden\" name=\"day\" value=\"");
+        sb_html(&b, t.date);
+        sb_puts(&b, "\"><div><label for=\"prot\">Today's grams</label>"
             "<input id=\"prot\" name=\"value\" type=\"number\" inputmode=\"decimal\" "
             "min=\"0\" step=\"1\"></div>"
             "<div class=\"btns\"><button class=\"log\" type=\"submit\">Save protein</button></div>"
@@ -1002,8 +1354,8 @@ static int parse_set_body(const char *ctype, const char *body, char *ex, size_t 
     return got_ex && got_reps && *reps > 0;
 }
 
-static void handle_set(SB *out, const char *ctype, const char *body) {
-    char ex[256], note[256];
+static void handle_set(SB *out, const char *ctype, const char *body, const char *query) {
+    char ex[256], note[256], resolved[256];
     int reps = 0, has_w = 0, has_rpe = 0;
     double weight = 0, rpe = 0;
     if (!parse_set_body(ctype, body ? body : "", ex, sizeof ex, &reps, &has_w, &weight,
@@ -1011,31 +1363,52 @@ static void handle_set(SB *out, const char *ctype, const char *body) {
         send_text(out, 400, "Bad Request", "text/plain; charset=utf-8", "need exercise and reps\n");
         return;
     }
-    int map[7];
-    build_weekday_map(load_float_rest(), map);
-    Today t; phoenix_now(&t, map);
-    apply_due(&t, map);
-    if (ROTATION[t.day_n].nlifts == 0) {
-        send_text(out, 400, "Bad Request", "text/plain; charset=utf-8", "rest day\n");
+    Today t;
+    char d[32] = "";
+    if (day_from_body(ctype, body, d, sizeof d)) {
+        view_day(&t, d);
+    } else {
+        char qd[32] = "";
+        if (query && form_get(query, "day", qd, sizeof qd) && qd[0]
+            && normalize_ymd(qd, d, sizeof d) == 0) {
+            view_day(&t, d);
+        } else {
+            phoenix_now(&t);
+        }
+    }
+    resolve_exercise(ex, resolved, sizeof resolved);
+    if (!resolved[0]) {
+        send_text(out, 400, "Bad Request", "text/plain; charset=utf-8", "need exercise and reps\n");
         return;
     }
-    const char *matched = match_exercise(ex, t.day_n);
-    if (!matched) {
-        send_text(out, 400, "Bad Request", "text/plain; charset=utf-8", "unknown exercise for today\n");
-        return;
+    Sess existing;
+    int have = load_session(t.date, &existing);
+    int dn = 0;
+    const char *lab = "";
+    const char *notes = "";
+    if (have) {
+        dn = existing.day_n;
+        lab = existing.label;
+        notes = existing.notes;
+    } else {
+        int from_lift = day_n_for_lift(resolved);
+        if (from_lift >= 0) {
+            dn = from_lift;
+            lab = ROTATION[from_lift].label;
+        }
     }
     if (sqlite3_exec(g_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
         send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "db busy\n");
         return;
     }
-    int sid = ensure_session(&t);
+    int sid = ensure_session_on(t.date, t.created, dn, lab, notes);
     if (!sid) {
         sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
         send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "session\n");
         return;
     }
-    int setn = next_set_n(sid, matched);
-    if (insert_set(sid, matched, setn, reps, has_w, weight, has_rpe, rpe, note) != 0) {
+    int setn = next_set_n(sid, resolved);
+    if (insert_set(sid, resolved, setn, reps, has_w, weight, has_rpe, rpe, note) != 0) {
         sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
         send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "insert\n");
         return;
@@ -1045,13 +1418,90 @@ static void handle_set(SB *out, const char *ctype, const char *body) {
         send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "commit\n");
         return;
     }
-    http_status(out, 303, "See Other", "text/plain; charset=utf-8", "Location: /\r\n", "ok\n", 3);
+    redirect_to_day(out, t.date);
+}
+
+static void handle_template(SB *out, const char *ctype, const char *body) {
+    Today t;
+    char d[32] = "", nbuf[32] = "";
+    if (day_from_body(ctype, body, d, sizeof d)) view_day(&t, d);
+    else phoenix_now(&t);
+    form_get(body ? body : "", "n", nbuf, sizeof nbuf);
+    trim(nbuf);
+    int skip = strcmp(nbuf, "skip") == 0;
+    int day_n = 0;
+    const char *label = "Skip / Rest";
+    const char *notes = "skip";
+    if (!skip) {
+        day_n = atoi(nbuf);
+        if (day_n != 1 && day_n != 2 && day_n != 3 && day_n != 5 && day_n != 6) {
+            send_text(out, 400, "Bad Request", "text/plain; charset=utf-8", "bad template\n");
+            return;
+        }
+        label = ROTATION[day_n].label;
+        notes = "";
+    } else {
+        day_n = 7;
+    }
+    if (sqlite3_exec(g_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "db busy\n");
+        return;
+    }
+    Sess sess;
+    int have = load_session(t.date, &sess);
+    if (have) {
+        sqlite3_stmt *cst = NULL;
+        int nsets = 0;
+        if (sqlite3_prepare_v2(g_db, "SELECT COUNT(*) FROM sets WHERE session_id=?", -1, &cst, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(cst, 1, sess.id);
+            if (sqlite3_step(cst) == SQLITE_ROW) nsets = sqlite3_column_int(cst, 0);
+            sqlite3_finalize(cst);
+        }
+        if (nsets > 0) {
+            sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+            redirect_to_day(out, t.date);
+            return;
+        }
+        char keep[512];
+        snprintf(keep, sizeof keep, "%s", sess.notes);
+        if (skip) snprintf(keep, sizeof keep, "skip");
+        else if (skip_notes(sess.notes)) keep[0] = 0;
+        if (update_session_template(sess.id, day_n, label, keep) != 0) {
+            sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+            send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "template\n");
+            return;
+        }
+    } else if (!ensure_session_on(t.date, t.created, day_n, label, notes)) {
+        sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+        send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "session\n");
+        return;
+    }
+    if (sqlite3_exec(g_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+        send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "commit\n");
+        return;
+    }
+    redirect_to_day(out, t.date);
+}
+
+static void handle_unlog(SB *out, const char *ctype, const char *body) {
+    Today t;
+    char d[32] = "", ex[256], resolved[256];
+    if (day_from_body(ctype, body, d, sizeof d)) view_day(&t, d);
+    else phoenix_now(&t);
+    ex[0] = 0;
+    form_get(body ? body : "", "exercise", ex, sizeof ex);
+    trim(ex);
+    resolve_exercise(ex, resolved, sizeof resolved);
+    int sid = session_id_today(t.date);
+    if (sid && resolved[0]) delete_last_set(sid, resolved);
+    redirect_to_day(out, t.date);
 }
 
 static int path_is(const char *path, const char *want) { return strcmp(path, want) == 0; }
 
-static void handle_req(const char *method, const char *path, const char *headers,
-                       const char *body, SB *out) {
+static void handle_req(const char *method, const char *path, const char *query,
+                       const char *headers, const char *body, SB *out) {
     if (path_is(path, "/health")) {
         send_text(out, 200, "OK", "text/plain; charset=utf-8", "ok\n");
         return;
@@ -1060,10 +1510,18 @@ static void handle_req(const char *method, const char *path, const char *headers
         http_status(out, 204, "No Content", NULL, NULL, NULL, 0);
         return;
     }
-    if (path_is(path, "/") && strcmp(method, "GET") == 0) { handle_index(out); return; }
-    if (path_is(path, "/api/today") && strcmp(method, "GET") == 0) { handle_today_json(out); return; }
+    if (path_is(path, "/") && strcmp(method, "GET") == 0) { handle_index(out, query); return; }
+    if (path_is(path, "/api/today") && strcmp(method, "GET") == 0) { handle_today_json(out, query); return; }
     if (path_is(path, "/set") && strcmp(method, "POST") == 0) {
-        handle_set(out, hdr_get(headers, "Content-Type"), body);
+        handle_set(out, hdr_get(headers, "Content-Type"), body, query);
+        return;
+    }
+    if (path_is(path, "/template") && strcmp(method, "POST") == 0) {
+        handle_template(out, hdr_get(headers, "Content-Type"), body);
+        return;
+    }
+    if (path_is(path, "/unlog") && strcmp(method, "POST") == 0) {
+        handle_unlog(out, hdr_get(headers, "Content-Type"), body);
         return;
     }
     if ((path_is(path, "/protein") || path_is(path, "/api/protein")) && strcmp(method, "POST") == 0) {
@@ -1071,6 +1529,7 @@ static void handle_req(const char *method, const char *path, const char *headers
         return;
     }
     if (path_is(path, "/") || path_is(path, "/api/today") || path_is(path, "/set")
+        || path_is(path, "/template") || path_is(path, "/unlog")
         || path_is(path, "/protein") || path_is(path, "/api/protein")) {
         send_text(out, 405, "Method Not Allowed", "text/plain; charset=utf-8", "method\n");
         return;
@@ -1135,7 +1594,8 @@ static void serve_conn(Conn *c) {
         return;
     }
     char *q = strchr(path, '?');
-    if (q) *q = 0;
+    const char *query = "";
+    if (q) { *q = 0; query = q + 1; }
     char *bodyc = NULL;
     if (blen) {
         bodyc = malloc(blen + 1);
@@ -1147,8 +1607,8 @@ static void serve_conn(Conn *c) {
         memcpy(bodyc, body, blen);
         bodyc[blen] = 0;
     }
-    handle_req(method, path, hdrs, bodyc ? bodyc : "", &c->out);
-    fprintf(stderr, "%s %s -> %d bytes\n", method, path, (int)c->out.n);
+    handle_req(method, path, query, hdrs, bodyc ? bodyc : "", &c->out);
+    fprintf(stderr, "%s %s%s%s -> %d bytes\n", method, path, query && query[0] ? "?" : "", query ? query : "", (int)c->out.n);
     free(bodyc);
     c->writing = 1;
     c->out_off = 0;
