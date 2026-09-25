@@ -14,6 +14,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -74,7 +76,7 @@ static const Lift LIFTS_6[] = {
 };
 
 static const DayProg ROTATION[8] = {
-    [0] = {"Rest / Fasting", NULL, 0},
+    [0] = {"Rest", NULL, 0},
     [1] = {"Chest & Side Delts", LIFTS_1, 4},
     [2] = {"Back & Rear Delts", LIFTS_2, 4},
     [3] = {"Arms", LIFTS_3, 4},
@@ -91,6 +93,10 @@ static int g_port = DEFAULT_PORT;
 static char g_dbpath[512];
 static sqlite3 *g_db = NULL;
 static volatile sig_atomic_t g_stop = 0;
+static char g_base[128]; /* mount prefix, e.g. "/fit"; empty = root */
+static char g_tz[64];     /* IANA zone for the training day; empty = process local time */
+static char g_protein_target[64]; /* optional UI hint, e.g. "150g"; empty = hidden */
+
 
 typedef struct { char *d; size_t n, cap; } SB;
 typedef struct { int fd, writing; SB in, out; size_t out_off; } Conn;
@@ -194,6 +200,39 @@ static void url_decode(char *s) {
     *w = 0;
 }
 
+
+static void set_base_path(const char *raw) {
+    g_base[0] = 0;
+    if (!raw) return;
+    char tmp[sizeof g_base];
+    snprintf(tmp, sizeof tmp, "%s", raw);
+    trim(tmp);
+    if (!tmp[0] || strcmp(tmp, "/") == 0) return;
+    size_t n = 0;
+    if (tmp[0] != '/') {
+        if (n + 1 >= sizeof g_base) return;
+        g_base[n++] = '/';
+    }
+    for (size_t i = 0; tmp[i] && n + 1 < sizeof g_base; i++)
+        g_base[n++] = tmp[i];
+    g_base[n] = 0;
+    while (n > 1 && g_base[n - 1] == '/') g_base[--n] = 0;
+    if (strcmp(g_base, "/") == 0) g_base[0] = 0;
+}
+
+static int exe_dir(char *out, size_t n) {
+    char link[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", link, sizeof link - 1);
+    if (len < 0) return -1;
+    link[len] = 0;
+    char *slash = strrchr(link, '/');
+    if (!slash) return -1;
+    *slash = 0;
+    if (strlen(link) + 1 > n) return -1;
+    memcpy(out, link, strlen(link) + 1);
+    return 0;
+}
+
 static int forbidden_bind(const char *ip) {
     return !ip || !ip[0] || strcmp(ip, "0.0.0.0") == 0 || strcmp(ip, "*") == 0 ||
            strcmp(ip, "::") == 0 || strcmp(ip, "[::]") == 0;
@@ -255,9 +294,14 @@ typedef struct {
     char notes[512];
 } Sess;
 
-static void phoenix_now(Today *t) {
-    setenv("TZ", "America/Phoenix", 1);
+static void apply_tz(void) {
+    /* --tz / FITD_TZ pins the training-day zone; otherwise keep the host's TZ / localtime. */
+    if (g_tz[0]) setenv("TZ", g_tz, 1);
     tzset();
+}
+
+static void local_now(Today *t) {
+    apply_tz();
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
@@ -403,7 +447,7 @@ static void apply_due(HoldToday *t, int weekday_map[7]) {
     }
     if (t->day_n == 0)
         snprintf(t->hold_line, sizeof t->hold_line,
-                 "HOLD: %s %s unlogged — cycle does not advance (Monday fasting rest)",
+                 "HOLD: %s %s unlogged — cycle does not advance (rest day)",
                  hd, ROTATION[hn].label);
     else if (cal != hn)
         snprintf(t->hold_line, sizeof t->hold_line,
@@ -505,7 +549,7 @@ static void resolve_exercise(const char *name, char *out, size_t n) {
     snprintf(out, n, "%s", tmp);
 }
 
-static int day_n_from_label(const char *label) {
+static int __attribute__((unused)) day_n_from_label(const char *label) {
     if (!label || !label[0]) return -1;
     if (label[0] >= '0' && label[0] <= '7' && label[1] == 0) return label[0] - '0';
     char buf[128];
@@ -729,14 +773,101 @@ static void send_sb(SB *out, int code, const char *reason, const char *ctype, SB
     http_status(out, code, reason, ctype, NULL, body->d ? body->d : "", body->n);
 }
 
+static void redirect_loc(SB *out, int code, const char *reason, const char *loc) {
+    char hdr[640];
+    snprintf(hdr, sizeof hdr, "Location: %s\r\n", loc);
+    http_status(out, code, reason, "text/plain; charset=utf-8", hdr, "ok\n", 3);
+}
+
 static void redirect_to_day(SB *out, const char *day) {
-    char hdr[96];
-    snprintf(hdr, sizeof hdr, "Location: /?day=%s\r\n", day);
-    http_status(out, 303, "See Other", "text/plain; charset=utf-8", hdr, "ok\n", 3);
+    char loc[192];
+    snprintf(loc, sizeof loc, "%s/?day=%s", g_base, day);
+    redirect_loc(out, 303, "See Other", loc);
+}
+
+static void redirect_base_root(SB *out, const char *query) {
+    char loc[384];
+    if (query && query[0])
+        snprintf(loc, sizeof loc, "%s/?%s", g_base, query);
+    else
+        snprintf(loc, sizeof loc, "%s/", g_base);
+    redirect_loc(out, 302, "Found", loc);
+}
+
+static void send_png_file(SB *out, const char *filename) {
+    char dir[PATH_MAX], fpath[PATH_MAX];
+    size_t dlen, flen;
+    if (exe_dir(dir, sizeof dir) != 0) {
+        send_text(out, 404, "Not Found", "text/plain; charset=utf-8", "no\n");
+        return;
+    }
+    dlen = strlen(dir);
+    flen = strlen(filename);
+    if (dlen + 1 + flen + 1 > sizeof fpath) {
+        send_text(out, 404, "Not Found", "text/plain; charset=utf-8", "no\n");
+        return;
+    }
+    memcpy(fpath, dir, dlen);
+    fpath[dlen] = '/';
+    memcpy(fpath + dlen + 1, filename, flen + 1);
+    int fd = open(fpath, O_RDONLY);
+    if (fd < 0) {
+        send_text(out, 404, "Not Found", "text/plain; charset=utf-8", "no\n");
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (size_t)st.st_size > 8u * 1024u * 1024u) {
+        close(fd);
+        send_text(out, 404, "Not Found", "text/plain; charset=utf-8", "no\n");
+        return;
+    }
+    SB body;
+    sb_init(&body);
+    if (sb_reserve(&body, (size_t)st.st_size) != 0) {
+        close(fd);
+        sb_free(&body);
+        send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "mem\n");
+        return;
+    }
+    ssize_t got = read(fd, body.d, (size_t)st.st_size);
+    close(fd);
+    if (got != (ssize_t)st.st_size) {
+        sb_free(&body);
+        send_text(out, 500, "Internal Server Error", "text/plain; charset=utf-8", "read\n");
+        return;
+    }
+    body.n = (size_t)got;
+    body.d[body.n] = 0;
+    send_sb(out, 200, "OK", "image/png", &body);
+    sb_free(&body);
+}
+
+static void handle_manifest(SB *out) {
+    SB body;
+    sb_init(&body);
+    sb_printf(&body,
+        "{"
+        "\"name\":\"Oda Fit\","
+        "\"short_name\":\"Oda Fit\","
+        "\"start_url\":\"%s/\","
+        "\"scope\":\"%s/\","
+        "\"id\":\"%s/\","
+        "\"display\":\"standalone\","
+        "\"background_color\":\"#070708\","
+        "\"theme_color\":\"#070708\","
+        "\"icons\":["
+        "{\"src\":\"%s/icon-192.png\",\"sizes\":\"192x192\",\"type\":\"image/png\",\"purpose\":\"any\"},"
+        "{\"src\":\"%s/icon-512.png\",\"sizes\":\"512x512\",\"type\":\"image/png\",\"purpose\":\"any\"}"
+        "]"
+        "}",
+        g_base, g_base, g_base, g_base, g_base);
+    send_sb(out, 200, "OK", "application/manifest+json", &body);
+    sb_free(&body);
 }
 
 static void view_day(Today *t, const char *want) {
-    phoenix_now(t);
+    local_now(t);
     if (!want || !want[0]) return;
     char norm[32];
     if (normalize_ymd(want, norm, sizeof norm) != 0) return;
@@ -851,7 +982,7 @@ static int day_from_body(const char *ctype, const char *body, char *out, size_t 
 static void view_from_query(Today *t, const char *query) {
     char d[32] = "";
     if (query && form_get(query, "day", d, sizeof d) && d[0]) view_day(t, d);
-    else phoenix_now(t);
+    else local_now(t);
 }
 
 static void append_logged_json(SB *s, int sid, const char *ex) {
@@ -1093,7 +1224,7 @@ static void handle_protein(SB *out, const char *ctype, const char *body) {
         if (date[0] && normalize_ymd(date, norm, sizeof norm) == 0)
             snprintf(date, sizeof date, "%s", norm);
         else {
-            Today t; phoenix_now(&t);
+            Today t; local_now(&t);
             snprintf(date, sizeof date, "%s", t.date);
         }
     }
@@ -1135,8 +1266,8 @@ static void render_lift_card(SB *b, int sid, const char *day, const char *name,
     sb_html(b, tgt);
     sb_puts(b, "</div></div>");
     render_logged_html(b, sid, name);
-    sb_puts(b, "<form method=\"post\" action=\"/set\" autocomplete=\"off\">"
-        "<input type=\"hidden\" name=\"day\" value=\"");
+    sb_printf(b, "<form method=\"post\" action=\"%s/set\" autocomplete=\"off\">", g_base);
+    sb_puts(b, "<input type=\"hidden\" name=\"day\" value=\"");
     sb_html(b, day);
     sb_puts(b, "\"><input type=\"hidden\" name=\"exercise\" value=\"");
     sb_html(b, name);
@@ -1151,8 +1282,8 @@ static void render_lift_card(SB *b, int sid, const char *day, const char *name,
         "<button class=\"dropb\" type=\"submit\" name=\"note\" value=\"drop\">Drop</button>"
         "</div></form>");
     if (count_logged(sid, name) > 0) {
-        sb_puts(b, "<form class=\"undo\" method=\"post\" action=\"/unlog\" autocomplete=\"off\">"
-            "<input type=\"hidden\" name=\"day\" value=\"");
+        sb_printf(b, "<form class=\"undo\" method=\"post\" action=\"%s/unlog\" autocomplete=\"off\">", g_base);
+        sb_puts(b, "<input type=\"hidden\" name=\"day\" value=\"");
         sb_html(b, day);
         sb_puts(b, "\"><input type=\"hidden\" name=\"exercise\" value=\"");
         sb_html(b, name);
@@ -1177,7 +1308,13 @@ static void handle_index(SB *out, const char *query) {
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">"
         "<meta name=\"theme-color\" content=\"#070708\">"
         "<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">"
-        "<title>ODA FIT</title><style>");
+        "<title>ODA FIT</title>");
+    sb_printf(&b,
+        "<link rel=\"manifest\" href=\"%s/manifest.webmanifest\">"
+        "<link rel=\"apple-touch-icon\" href=\"%s/icon-192.png\">"
+        "<link rel=\"icon\" href=\"%s/icon-192.png\">"
+        "<script>const BASE=\"%s\";</script><style>",
+        g_base, g_base, g_base, g_base);
     sb_puts(&b, CSS);
     sb_puts(&b, "</style></head><body><div class=\"wrap\"><header>"
         "<svg class=\"mon\" viewBox=\"0 0 64 64\" aria-hidden=\"true\">"
@@ -1211,19 +1348,19 @@ static void handle_index(SB *out, const char *query) {
     sb_puts(&b, ",\"label\":"); sb_json(&b, have_label ? sess.label : NULL);
     sb_puts(&b, ",\"locked_to_weekday\":false,\"after_one_set_advanced\":false,\"held\":false}");
     sb_puts(&b, "</script>");
-    sb_puts(&b, "<div class=\"nav\"><a class=\"arr\" href=\"/?day=");
+    sb_printf(&b, "<div class=\"nav\"><a class=\"arr\" href=\"%s/?day=", g_base);
     sb_puts(&b, prev);
-    sb_puts(&b, "\">‹</a><form method=\"get\" action=\"/\">"
-        "<input class=\"datein\" type=\"date\" name=\"day\" value=\"");
+    sb_printf(&b, "\">‹</a><form method=\"get\" action=\"%s/\">"
+        "<input class=\"datein\" type=\"date\" name=\"day\" value=\"", g_base);
     sb_html(&b, t.date);
-    sb_puts(&b, "\" onchange=\"this.form.submit()\"></form>"
-        "<a class=\"arr\" href=\"/?day=");
+    sb_printf(&b, "\" onchange=\"this.form.submit()\"></form>"
+        "<a class=\"arr\" href=\"%s/?day=", g_base);
     sb_puts(&b, nxt);
     sb_puts(&b, "\">›</a></div></header>");
 
     if (!have_label) {
-        sb_puts(&b, "<form method=\"post\" action=\"/template\" class=\"chips\">"
-            "<input type=\"hidden\" name=\"day\" value=\"");
+        sb_printf(&b, "<form method=\"post\" action=\"%s/template\" class=\"chips\">", g_base);
+        sb_puts(&b, "<input type=\"hidden\" name=\"day\" value=\"");
         sb_html(&b, t.date);
         sb_puts(&b, "\">");
         {
@@ -1277,10 +1414,10 @@ static void handle_index(SB *out, const char *query) {
         }
     }
 
-    sb_puts(&b, "<article class=\"card\"><h2>Add a lift</h2>"
+    sb_printf(&b, "<article class=\"card\"><h2>Add a lift</h2>"
         "<div class=\"meta\">Any known lift from the program, or type a name.</div>"
-        "<form method=\"post\" action=\"/set\" autocomplete=\"off\">"
-        "<input type=\"hidden\" name=\"day\" value=\"");
+        "<form method=\"post\" action=\"%s/set\" autocomplete=\"off\">", g_base);
+    sb_puts(&b, "<input type=\"hidden\" name=\"day\" value=\"");
     sb_html(&b, t.date);
     sb_puts(&b, "\"><div class=\"span\"><label for=\"ox\">Exercise</label>"
         "<input id=\"ox\" name=\"exercise\" type=\"text\" list=\"known-lifts\" maxlength=\"120\" required>"
@@ -1302,8 +1439,13 @@ static void handle_index(SB *out, const char *query) {
     {
         double pv = 0; char pu[16] = "g", pd[16] = "";
         int phave = latest_protein(&pv, pu, sizeof pu, pd, sizeof pd);
-        sb_puts(&b, "<article class=\"card prot\"><h2>Protein</h2>"
-            "<div class=\"meta\">Target 240–260g. Optional — sets never wait on this.</div>"
+        sb_puts(&b, "<article class=\"card prot\"><h2>Protein</h2><div class=\"meta\">");
+        if (g_protein_target[0]) {
+            sb_puts(&b, "Target ");
+            sb_html(&b, g_protein_target);
+            sb_puts(&b, ". ");
+        }
+        sb_puts(&b, "Optional — sets never wait on this.</div>"
             "<div class=\"tgt\"><div class=\"k\">Latest</div><div class=\"v\">");
         if (phave) sb_printf(&b, "%g%s", pv, pu[0] ? pu : "g");
         else sb_puts(&b, "—");
@@ -1313,8 +1455,8 @@ static void handle_index(SB *out, const char *query) {
             sb_html(&b, pd);
             sb_puts(&b, "</div>");
         }
-        sb_puts(&b, "<form method=\"post\" action=\"/protein\" autocomplete=\"off\">"
-            "<input type=\"hidden\" name=\"day\" value=\"");
+        sb_printf(&b, "<form method=\"post\" action=\"%s/protein\" autocomplete=\"off\">", g_base);
+        sb_puts(&b, "<input type=\"hidden\" name=\"day\" value=\"");
         sb_html(&b, t.date);
         sb_puts(&b, "\"><div><label for=\"prot\">Today's grams</label>"
             "<input id=\"prot\" name=\"value\" type=\"number\" inputmode=\"decimal\" "
@@ -1373,7 +1515,7 @@ static void handle_set(SB *out, const char *ctype, const char *body, const char 
             && normalize_ymd(qd, d, sizeof d) == 0) {
             view_day(&t, d);
         } else {
-            phoenix_now(&t);
+            local_now(&t);
         }
     }
     resolve_exercise(ex, resolved, sizeof resolved);
@@ -1425,7 +1567,7 @@ static void handle_template(SB *out, const char *ctype, const char *body) {
     Today t;
     char d[32] = "", nbuf[32] = "";
     if (day_from_body(ctype, body, d, sizeof d)) view_day(&t, d);
-    else phoenix_now(&t);
+    else local_now(&t);
     form_get(body ? body : "", "n", nbuf, sizeof nbuf);
     trim(nbuf);
     int skip = strcmp(nbuf, "skip") == 0;
@@ -1488,7 +1630,7 @@ static void handle_unlog(SB *out, const char *ctype, const char *body) {
     Today t;
     char d[32] = "", ex[256], resolved[256];
     if (day_from_body(ctype, body, d, sizeof d)) view_day(&t, d);
-    else phoenix_now(&t);
+    else local_now(&t);
     ex[0] = 0;
     form_get(body ? body : "", "exercise", ex, sizeof ex);
     trim(ex);
@@ -1508,6 +1650,22 @@ static void handle_req(const char *method, const char *path, const char *query,
     }
     if (path_is(path, "/favicon.ico")) {
         http_status(out, 204, "No Content", NULL, NULL, NULL, 0);
+        return;
+    }
+    if (path_is(path, "/manifest.webmanifest") && strcmp(method, "GET") == 0) {
+        handle_manifest(out);
+        return;
+    }
+    if (path_is(path, "/icon-192.png") && strcmp(method, "GET") == 0) {
+        send_png_file(out, "icon-192.png");
+        return;
+    }
+    if (path_is(path, "/icon-512.png") && strcmp(method, "GET") == 0) {
+        send_png_file(out, "icon-512.png");
+        return;
+    }
+    if (path_is(path, "/apple-touch-icon.png") && strcmp(method, "GET") == 0) {
+        send_png_file(out, "icon-192.png");
         return;
     }
     if (path_is(path, "/") && strcmp(method, "GET") == 0) { handle_index(out, query); return; }
@@ -1530,7 +1688,9 @@ static void handle_req(const char *method, const char *path, const char *query,
     }
     if (path_is(path, "/") || path_is(path, "/api/today") || path_is(path, "/set")
         || path_is(path, "/template") || path_is(path, "/unlog")
-        || path_is(path, "/protein") || path_is(path, "/api/protein")) {
+        || path_is(path, "/protein") || path_is(path, "/api/protein")
+        || path_is(path, "/manifest.webmanifest") || path_is(path, "/icon-192.png")
+        || path_is(path, "/icon-512.png") || path_is(path, "/apple-touch-icon.png")) {
         send_text(out, 405, "Method Not Allowed", "text/plain; charset=utf-8", "method\n");
         return;
     }
@@ -1596,6 +1756,31 @@ static void serve_conn(Conn *c) {
     char *q = strchr(path, '?');
     const char *query = "";
     if (q) { *q = 0; query = q + 1; }
+    if (g_base[0]) {
+        size_t bl = strlen(g_base);
+        if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
+            redirect_base_root(&c->out, query);
+            fprintf(stderr, "%s %s%s%s -> redirect %s/\n", method, path,
+                    query && query[0] ? "?" : "", query ? query : "", g_base);
+            c->writing = 1;
+            c->out_off = 0;
+            return;
+        }
+        if (strcmp(path, g_base) == 0) {
+            if (strcmp(method, "GET") == 0) {
+                redirect_base_root(&c->out, query);
+                fprintf(stderr, "%s %s%s%s -> redirect %s/\n", method, path,
+                        query && query[0] ? "?" : "", query ? query : "", g_base);
+                c->writing = 1;
+                c->out_off = 0;
+                return;
+            }
+            snprintf(path, sizeof path, "/");
+        } else if (strncmp(path, g_base, bl) == 0 && path[bl] == '/') {
+            memmove(path, path + bl, strlen(path + bl) + 1);
+            if (!path[0]) snprintf(path, sizeof path, "/");
+        }
+    }
     char *bodyc = NULL;
     if (blen) {
         bodyc = malloc(blen + 1);
@@ -1644,15 +1829,24 @@ static int listen_ts(void) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: fitd [--bind IPV4] [--port N] [--db PATH]\n"
+            "usage: fitd [--bind IPV4] [--port N] [--db PATH] [--base /path] [--tz ZONE]\n"
+            "            [--protein-target TEXT]\n"
             "  default bind: tailscale ip -4, else 127.0.0.1 (never 0.0.0.0)\n"
             "  default port: %d\n"
-            "  default db:   $HOME%s\n",
+            "  default db:   $HOME%s\n"
+            "  --base PATH   URL mount prefix (e.g. /fit); also FITD_BASE_PATH\n"
+            "  --tz ZONE     IANA zone for the training day (e.g. Europe/Berlin); also FITD_TZ.\n"
+            "                Default: the process TZ / system local time.\n"
+            "  --protein-target TEXT  optional hint on the protein card (e.g. 150g); also\n"
+            "                FITD_PROTEIN_TARGET. Default: none.\n",
             DEFAULT_PORT, DEFAULT_DB_SUFFIX);
 }
 
 int main(int argc, char **argv) {
-    int have_bind = 0;
+    int have_bind = 0, have_base = 0, have_tz = 0, have_pt = 0;
+    g_base[0] = 0;
+    g_tz[0] = 0;
+    g_protein_target[0] = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { usage(); return 0; }
         if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
@@ -1662,8 +1856,31 @@ int main(int argc, char **argv) {
             g_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
             snprintf(g_dbpath, sizeof g_dbpath, "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--base") == 0 && i + 1 < argc) {
+            set_base_path(argv[++i]);
+            have_base = 1;
+        } else if (strcmp(argv[i], "--tz") == 0 && i + 1 < argc) {
+            snprintf(g_tz, sizeof g_tz, "%s", argv[++i]);
+            have_tz = 1;
+        } else if (strcmp(argv[i], "--protein-target") == 0 && i + 1 < argc) {
+            snprintf(g_protein_target, sizeof g_protein_target, "%s", argv[++i]);
+            have_pt = 1;
         } else { usage(); return 2; }
     }
+    if (!have_base) {
+        const char *env_base = getenv("FITD_BASE_PATH");
+        if (env_base) set_base_path(env_base);
+    }
+    if (!have_tz) {
+        const char *env_tz = getenv("FITD_TZ");
+        if (env_tz && env_tz[0]) snprintf(g_tz, sizeof g_tz, "%s", env_tz);
+    }
+    if (!have_pt) {
+        const char *env_pt = getenv("FITD_PROTEIN_TARGET");
+        if (env_pt && env_pt[0]) snprintf(g_protein_target, sizeof g_protein_target, "%s", env_pt);
+    }
+    trim(g_tz);
+    trim(g_protein_target);
     if (g_port <= 0 || g_port > 65535) { fprintf(stderr, "fitd: bad port\n"); return 2; }
     if (!g_dbpath[0]) default_db_path(g_dbpath, sizeof g_dbpath);
     if (!have_bind) detect_tailscale(g_bind, sizeof g_bind);
@@ -1671,8 +1888,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "fitd: refusing bind '%s' — Tailscale IPv4 or 127.0.0.1 only\n", g_bind);
         return 2;
     }
-    setenv("TZ", "America/Phoenix", 1);
-    tzset();
+    apply_tz();
     if (sqlite3_open_v2(g_dbpath, &g_db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
         fprintf(stderr, "fitd: cannot open db %s: %s\n", g_dbpath,
                 g_db ? sqlite3_errmsg(g_db) : "open failed");
@@ -1685,7 +1901,8 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "fitd listen %s:%d db=%s\n", g_bind, g_port, g_dbpath);
+    fprintf(stderr, "fitd listen %s:%d%s db=%s tz=%s\n", g_bind, g_port, g_base, g_dbpath,
+            g_tz[0] ? g_tz : "(local)");
 
     Conn conns[MAX_CONNS];
     memset(conns, 0, sizeof conns);
